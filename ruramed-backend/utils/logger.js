@@ -6,315 +6,350 @@ import fs from 'fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Create logs directory if it doesn't exist
+const isProduction = process.env.NODE_ENV === 'production';
+
+// ---------------------------------------------------------
+// 📁 Create logs directory (only in development)
+// ---------------------------------------------------------
 const logsDir = path.join(__dirname, '../logs');
-if (!fs.existsSync(logsDir)) {
-    fs.mkdirSync(logsDir, { recursive: true });
+if (!isProduction && !fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
 }
 
-// Custom log format for healthcare applications
+// ---------------------------------------------------------
+// 🧩 Log Formats
+// ---------------------------------------------------------
+
+// Structured JSON format (GCP-compatible)
 const logFormat = winston.format.combine(
-    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-    winston.format.errors({ stack: true }),
-    winston.format.json(),
-    winston.format.printf(({ timestamp, level, message, stack, ...meta }) => {
-        let logEntry = {
-            timestamp,
-            level: level.toUpperCase(),
-            message,
-            environment: process.env.NODE_ENV || 'development',
-            ...meta
-        };
+  winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+  winston.format.errors({ stack: true }),
+  winston.format.json(),
+  winston.format.printf(({ timestamp, level, message, stack, ...meta }) => {
+    const logEntry = {
+      timestamp,
+      severity: level.toUpperCase(), // GCP uses 'severity' instead of 'level'
+      message,
+      environment: process.env.NODE_ENV || 'development',
+      service: 'ruramed-backend',
+      version: '2.0.0',
+      ...meta,
+    };
 
-        if (stack) {
-            logEntry.stack = stack;
-        }
+    if (stack) logEntry.stack = stack;
 
-        return JSON.stringify(logEntry);
-    })
+    return JSON.stringify(logEntry);
+  })
 );
 
-// Console format for development
+// Console-friendly format for development
 const consoleFormat = winston.format.combine(
-    winston.format.timestamp({ format: 'HH:mm:ss' }),
-    winston.format.colorize(),
-    winston.format.printf(({ timestamp, level, message, ...meta }) => {
-        let logMessage = `${timestamp} [${level}] ${message}`;
-        
-        // Add metadata if present
-        if (Object.keys(meta).length > 0) {
-            const cleanMeta = { ...meta };
-            delete cleanMeta.timestamp;
-            delete cleanMeta.level;
-            delete cleanMeta.message;
-            
-            if (Object.keys(cleanMeta).length > 0) {
-                logMessage += ` | ${JSON.stringify(cleanMeta)}`;
-            }
-        }
-        
-        return logMessage;
-    })
+  winston.format.timestamp({ format: 'HH:mm:ss' }),
+  winston.format.colorize(),
+  winston.format.printf(({ timestamp, level, message, ...meta }) => {
+    let logMessage = `${timestamp} [${level}] ${message}`;
+
+    // Add metadata if present
+    if (Object.keys(meta).length > 0) {
+      const cleanMeta = { ...meta };
+      delete cleanMeta.timestamp;
+      delete cleanMeta.level;
+      delete cleanMeta.message;
+      delete cleanMeta.severity;
+      delete cleanMeta.service;
+      delete cleanMeta.version;
+      delete cleanMeta.environment;
+
+      if (Object.keys(cleanMeta).length > 0) {
+        logMessage += ` | ${JSON.stringify(cleanMeta)}`;
+      }
+    }
+
+    return logMessage;
+  })
 );
 
-// Create Winston logger instance
+// ---------------------------------------------------------
+// 🚚 Transports
+// ---------------------------------------------------------
+const transports = [];
+
+// Console transport (always enabled – Cloud Logging captures stdout)
+transports.push(
+  new winston.transports.Console({
+    format: isProduction ? logFormat : consoleFormat,
+    level: process.env.LOG_LEVEL || (isProduction ? 'info' : 'debug'),
+  })
+);
+
+// File transports (only in development or if explicitly enabled)
+if (!isProduction || process.env.ENABLE_FILE_LOGGING === 'true') {
+  transports.push(
+    // Error logs
+    new winston.transports.File({
+      filename: path.join(logsDir, 'error.log'),
+      level: 'error',
+      maxsize: 10 * 1024 * 1024,
+      maxFiles: 5,
+      tailable: true,
+      format: logFormat,
+    }),
+    // Combined logs
+    new winston.transports.File({
+      filename: path.join(logsDir, 'combined.log'),
+      maxsize: 10 * 1024 * 1024,
+      maxFiles: 10,
+      tailable: true,
+      format: logFormat,
+    }),
+    // Security logs
+    new winston.transports.File({
+      filename: path.join(logsDir, 'security.log'),
+      level: 'warn',
+      maxsize: 5 * 1024 * 1024,
+      maxFiles: 5,
+      tailable: true,
+      format: logFormat,
+    }),
+    // Audit logs
+    new winston.transports.File({
+      filename: path.join(logsDir, 'audit.log'),
+      maxsize: 20 * 1024 * 1024,
+      maxFiles: 15,
+      tailable: true,
+      format: logFormat,
+    })
+  );
+}
+
+// ---------------------------------------------------------
+// 🧠 Logger Instance
+// ---------------------------------------------------------
 const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || 'info',
-    format: logFormat,
-    transports: [
-        // Error logs - separate file for errors only
-        new winston.transports.File({
-            filename: path.join(logsDir, 'error.log'),
-            level: 'error',
-            maxsize: 10 * 1024 * 1024, // 10MB
-            maxFiles: 5,
-            tailable: true
-        }),
-
-        // Combined logs - all levels
-        new winston.transports.File({
-            filename: path.join(logsDir, 'combined.log'),
-            maxsize: 10 * 1024 * 1024, // 10MB
-            maxFiles: 10,
-            tailable: true
-        }),
-
-        // Security logs - authentication, authorization events
-        new winston.transports.File({
-            filename: path.join(logsDir, 'security.log'),
-            level: 'warn',
-            maxsize: 5 * 1024 * 1024, // 5MB
-            maxFiles: 5,
-            tailable: true,
-            format: winston.format.combine(
-                winston.format.timestamp(),
-                winston.format.json()
-            )
-        }),
-
-        // Healthcare-specific audit logs
-        new winston.transports.File({
-            filename: path.join(logsDir, 'audit.log'),
-            maxsize: 20 * 1024 * 1024, // 20MB
-            maxFiles: 15,
-            tailable: true,
-            format: winston.format.combine(
-                winston.format.timestamp(),
-                winston.format.json()
-            )
-        })
-    ],
-
-    // Handle uncaught exceptions
-    exceptionHandlers: [
-        new winston.transports.File({
-            filename: path.join(logsDir, 'exceptions.log'),
-            maxsize: 10 * 1024 * 1024,
-            maxFiles: 3
-        })
-    ],
-
-    // Handle unhandled promise rejections
-    rejectionHandlers: [
-        new winston.transports.File({
-            filename: path.join(logsDir, 'rejections.log'),
-            maxsize: 10 * 1024 * 1024,
-            maxFiles: 3
-        })
-    ]
+  level: process.env.LOG_LEVEL || (isProduction ? 'info' : 'debug'),
+  format: logFormat,
+  transports,
+  defaultMeta: {
+    service: 'ruramed-backend',
+    environment: process.env.NODE_ENV || 'development',
+    version: '2.0.0',
+  },
 });
 
-// Add console transport for development
-if (process.env.NODE_ENV !== 'production') {
-    logger.add(new winston.transports.Console({
-        format: consoleFormat,
-        level: 'debug'
-    }));
+// Exception and rejection handlers (only in development)
+if (!isProduction) {
+  logger.exceptions.handle(
+    new winston.transports.File({
+      filename: path.join(logsDir, 'exceptions.log'),
+      maxsize: 10 * 1024 * 1024,
+      maxFiles: 3,
+    })
+  );
+
+  logger.rejections.handle(
+    new winston.transports.File({
+      filename: path.join(logsDir, 'rejections.log'),
+      maxsize: 10 * 1024 * 1024,
+      maxFiles: 3,
+    })
+  );
 }
 
-// Healthcare-specific logging functions
+// ---------------------------------------------------------
+// 🏥 Healthcare-Specific Loggers
+// ---------------------------------------------------------
 export const logHealthcareEvent = (eventType, data, userId = null) => {
-    logger.info('Healthcare Event', {
-        event_type: eventType,
-        user_id: userId,
-        data: data,
-        category: 'healthcare',
-        timestamp: new Date().toISOString()
-    });
+  logger.info('Healthcare Event', {
+    event_type: eventType,
+    user_id: userId,
+    data,
+    category: 'healthcare',
+    severity: 'INFO',
+  });
 };
 
 // Security event logging
 export const logSecurityEvent = (eventType, details, userId = null, ip = null) => {
-    logger.warn('Security Event', {
-        event_type: eventType,
-        user_id: userId,
-        ip_address: ip,
-        details: details,
-        category: 'security',
-        timestamp: new Date().toISOString()
-    });
+  logger.warn('Security Event', {
+    event_type: eventType,
+    user_id: userId,
+    ip_address: ip,
+    details,
+    category: 'security',
+    severity: 'WARNING',
+  });
 };
 
 // Database operation logging
 export const logDatabaseOperation = (operation, table, userId = null, details = null) => {
-    logger.info('Database Operation', {
-        operation: operation,
-        table: table,
-        user_id: userId,
-        details: details,
-        category: 'database',
-        timestamp: new Date().toISOString()
-    });
+  logger.info('Database Operation', {
+    operation,
+    table,
+    user_id: userId,
+    details,
+    category: 'database',
+    severity: 'INFO',
+  });
 };
 
 // API request/response logging
 export const logApiRequest = (req, res, responseTime) => {
-    const logData = {
-        method: req.method,
-        url: req.originalUrl,
-        status_code: res.statusCode,
-        response_time_ms: responseTime,
-        user_agent: req.get('User-Agent'),
-        ip_address: req.ip,
-        user_id: req.user?.id || null,
-        category: 'api'
-    };
+  const logData = {
+    method: req.method,
+    url: req.originalUrl,
+    status_code: res.statusCode,
+    response_time_ms: responseTime,
+    user_agent: req.get('User-Agent'),
+    ip_address: req.ip,
+    user_id: req.user?.id || null,
+    category: 'api',
+    'logging.googleapis.com/trace': req.headers['x-cloud-trace-context'],
+  };
 
-    // Log different levels based on status code
-    if (res.statusCode >= 500) {
-        logger.error('API Request - Server Error', logData);
-    } else if (res.statusCode >= 400) {
-        logger.warn('API Request - Client Error', logData);
-    } else {
-        logger.info('API Request - Success', logData);
-    }
+  if (res.statusCode >= 500) {
+    logger.error('API Request - Server Error', { ...logData, severity: 'ERROR' });
+  } else if (res.statusCode >= 400) {
+    logger.warn('API Request - Client Error', { ...logData, severity: 'WARNING' });
+  } else {
+    logger.info('API Request - Success', { ...logData, severity: 'INFO' });
+  }
 };
 
 // File operation logging
 export const logFileOperation = (operation, filename, userId = null, details = null) => {
-    logger.info('File Operation', {
-        operation: operation,
-        filename: filename,
-        user_id: userId,
-        details: details,
-        category: 'file_operation',
-        timestamp: new Date().toISOString()
-    });
+  logger.info('File Operation', {
+    operation,
+    filename,
+    user_id: userId,
+    details,
+    category: 'file_operation',
+    severity: 'INFO',
+  });
 };
 
 // Medicine operation logging
 export const logMedicineOperation = (operation, medicineId, userId = null, details = null) => {
-    logHealthcareEvent('medicine_operation', {
-        operation: operation,
-        medicine_id: medicineId,
-        details: details
-    }, userId);
+  logHealthcareEvent('medicine_operation', { operation, medicine_id: medicineId, details }, userId);
 };
 
 // Prescription operation logging
 export const logPrescriptionOperation = (operation, prescriptionId, userId = null, details = null) => {
-    logHealthcareEvent('prescription_operation', {
-        operation: operation,
-        prescription_id: prescriptionId,
-        details: details
-    }, userId);
+  logHealthcareEvent('prescription_operation', { operation, prescription_id: prescriptionId, details }, userId);
 };
 
 // Order operation logging
 export const logOrderOperation = (operation, orderId, userId = null, details = null) => {
-    logHealthcareEvent('order_operation', {
-        operation: operation,
-        order_id: orderId,
-        details: details
-    }, userId);
+  logHealthcareEvent('order_operation', { operation, order_id: orderId, details }, userId);
 };
 
 // Authentication logging
 export const logAuthEvent = (event, userId = null, ip = null, details = null) => {
-    logSecurityEvent(`auth_${event}`, details, userId, ip);
+  logSecurityEvent(`auth_${event}`, details, userId, ip);
 };
 
 // Error logging with context
 export const logError = (error, context = {}) => {
-    logger.error('Application Error', {
-        message: error.message,
-        stack: error.stack,
-        context: context,
-        category: 'error',
-        timestamp: new Date().toISOString()
-    });
+  logger.error('Application Error', {
+    message: error.message,
+    error_name: error.name,
+    error_code: error.code,
+    stack: error.stack,
+    context,
+    category: 'error',
+    severity: 'ERROR',
+    '@type':
+      'type.googleapis.com/google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent',
+  });
 };
 
 // Performance logging
 export const logPerformance = (operation, duration, details = null) => {
-    logger.info('Performance Metric', {
-        operation: operation,
-        duration_ms: duration,
-        details: details,
-        category: 'performance',
-        timestamp: new Date().toISOString()
-    });
+  const severity = duration > 2000 ? 'WARNING' : 'INFO';
+  logger.log(severity.toLowerCase(), 'Performance Metric', {
+    operation,
+    duration_ms: duration,
+    details,
+    category: 'performance',
+    severity,
+  });
 };
 
-// Audit trail logging for sensitive operations
+// Audit trail logging
 export const logAuditTrail = (action, resource, userId, oldData = null, newData = null) => {
-    const auditLog = logger.child({ category: 'audit' });
-    
-    auditLog.info('Audit Trail', {
-        action: action,
-        resource: resource,
-        user_id: userId,
-        old_data: oldData,
-        new_data: newData,
-        timestamp: new Date().toISOString(),
-        session_id: null // Can be added if session tracking is implemented
-    });
+  logger.info('Audit Trail', {
+    action,
+    resource,
+    user_id: userId,
+    old_data: oldData,
+    new_data: newData,
+    category: 'audit',
+    severity: 'NOTICE',
+  });
 };
 
-// Compliance logging for healthcare regulations
+// Compliance logging (e.g., HIPAA, GDPR)
 export const logComplianceEvent = (regulation, event, details, userId = null) => {
-    logger.info('Compliance Event', {
-        regulation: regulation, // e.g., 'HIPAA', 'GDPR'
-        event: event,
-        details: details,
-        user_id: userId,
-        category: 'compliance',
-        timestamp: new Date().toISOString()
-    });
+  logger.info('Compliance Event', {
+    regulation,
+    event,
+    details,
+    user_id: userId,
+    category: 'compliance',
+    severity: 'NOTICE',
+  });
 };
 
-// Request logging middleware
+// ---------------------------------------------------------
+// 🌐 Request Logging Middleware
+// ---------------------------------------------------------
 export const requestLoggerMiddleware = (req, res, next) => {
-    const startTime = Date.now();
-    
-    // Log incoming request
+  const startTime = Date.now();
+
+  // Extract trace context for GCP
+  const traceHeader = req.headers['x-cloud-trace-context'];
+  if (traceHeader && isProduction) {
+    const [trace] = traceHeader.split('/');
+    req.traceId = trace;
+  }
+
+  // Log incoming request in debug mode
+  if (!isProduction || process.env.LOG_LEVEL === 'debug') {
     logger.debug('Incoming Request', {
-        method: req.method,
-        url: req.originalUrl,
-        ip_address: req.ip,
-        user_agent: req.get('User-Agent'),
-        content_type: req.get('Content-Type'),
-        user_id: req.user?.id || null,
-        category: 'request'
+      method: req.method,
+      url: req.originalUrl,
+      ip_address: req.ip,
+      user_agent: req.get('User-Agent'),
+      content_type: req.get('Content-Type'),
+      user_id: req.user?.id || null,
+      category: 'request',
+      severity: 'DEBUG',
+      trace_id: req.traceId,
     });
+  }
 
-    // Override res.end to capture response
-    const originalEnd = res.end;
-    res.end = function(chunk, encoding) {
-        const responseTime = Date.now() - startTime;
-        
-        // Log API request with response time
-        logApiRequest(req, res, responseTime);
-        
-        // Call original end method
-        originalEnd.call(this, chunk, encoding);
-    };
+  // Override res.end to measure response time
+  const originalEnd = res.end;
+  res.end = function (chunk, encoding) {
+    const responseTime = Date.now() - startTime;
+    logApiRequest(req, res, responseTime);
+    originalEnd.call(this, chunk, encoding);
+  };
 
-    next();
+  next();
 };
 
-// Export main logger instance
-export { logger };
+// ---------------------------------------------------------
+// 🚀 Startup Log
+// ---------------------------------------------------------
+logger.info('Logger initialized', {
+  level: logger.level,
+  environment: process.env.NODE_ENV || 'development',
+  file_logging_enabled: !isProduction || process.env.ENABLE_FILE_LOGGING === 'true',
+  severity: 'INFO',
+});
 
-// Default export
+// ---------------------------------------------------------
+// 📤 Exports
+// ---------------------------------------------------------
+export { logger };
 export default logger;

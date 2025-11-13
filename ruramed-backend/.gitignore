@@ -1,0 +1,84 @@
+# ===========================
+# Dependencies
+# ===========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# ===========================
+# Environment Variables
+# ===========================
+.env
+.env.*
+.env.local
+.env.production
+.env.development
+
+# ===========================
+# Logs
+# ===========================
+logs/
+*.log
+
+# ===========================
+# Uploads (local development only)
+# ===========================
+uploads/
+
+# ===========================
+# OS Files
+# ===========================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ===========================
+# IDE / Editor Files
+# ===========================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ===========================
+# GCP Credentials (NEVER commit these!)
+# ===========================
+*.json
+gcloud-key.json
+service-account.json
+credentials.json
+
+# ===========================
+# Build Files
+# ===========================
+dist/
+build/
+
+# ===========================
+# Testing
+# ===========================
+coverage/
+.nyc_output/
+
+# ===========================
+# Temporary Files
+# ===========================
+tmp/
+temp/
+*.tmp
+
+# ===========================
+# Documentation
+# (Optional — keep if you want docs in repo)
+# ===========================
+Documentation Perplexity/
+
+# ===========================
+# Database Dumps
+# ===========================
+*.sql
+*.dump

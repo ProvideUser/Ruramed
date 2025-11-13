@@ -4,39 +4,87 @@ import { logger, logError, logDatabaseOperation, logPerformance } from '../utils
 
 dotenv.config();
 
-// Enhanced database connection pool with correct MySQL2 settings
-const db = mysql.createPool({
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Get SSL configuration for Cloud SQL
+const getSSLConfig = () => {
+    // If not production or no SSL cert provided, return false
+    if (!isProduction) {
+        return false;
+    }
+
+    // Check if using Cloud SQL Unix socket (recommended for GCP)
+    if (process.env.DB_SOCKET_PATH) {
+        return {
+            socketPath: process.env.DB_SOCKET_PATH
+        };
+    }
+
+    // If SSL certificates are provided (base64 encoded in Secret Manager)
+    if (process.env.DB_SSL_CA) {
+        return {
+            ssl: {
+                ca: Buffer.from(process.env.DB_SSL_CA, 'base64').toString('utf-8'),
+                cert: process.env.DB_SSL_CERT 
+                    ? Buffer.from(process.env.DB_SSL_CERT, 'base64').toString('utf-8') 
+                    : undefined,
+                key: process.env.DB_SSL_KEY 
+                    ? Buffer.from(process.env.DB_SSL_KEY, 'base64').toString('utf-8') 
+                    : undefined,
+                rejectUnauthorized: true
+            }
+        };
+    }
+
+    // Fallback: basic SSL without certificate verification (not recommended)
+    return {
+        ssl: {
+            rejectUnauthorized: false
+        }
+    };
+};
+
+// Build connection configuration
+const connectionConfig = {
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_DATABASE,
-    port: parseInt(process.env.DB_PORT) || 3306, // ✅ Parse port as integer with default fallback
+    port: parseInt(process.env.DB_PORT) || 3306,
     waitForConnections: true,
-    connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 20,
+    connectionLimit: isProduction 
+        ? parseInt(process.env.DB_CONNECTION_LIMIT) || 10  // Lower limit for Cloud Run
+        : parseInt(process.env.DB_CONNECTION_LIMIT) || 20,
     queueLimit: 0,
     idleTimeout: 300000, // 5 minutes
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,
-    // SSL configuration for production
-    ssl: process.env.NODE_ENV === 'production' ? {
-        rejectUnauthorized: false
-    } : false,
-    // Character set for proper UTF-8 support
     charset: 'utf8mb4',
-    // ✅ FIX: Force UTC timezone and return dates as strings
-    timezone: 'Z',           // Use 'Z' for UTC (ISO 8601 format)
-    dateStrings: true,       // Return dates as strings, not Date objects
+    timezone: 'Z',
+    dateStrings: true,
     supportBigNumbers: true,
-    bigNumberStrings: false
-});
+    bigNumberStrings: false,
+    connectTimeout: 10000, // 10 seconds connection timeout
+    acquireTimeout: 10000, // 10 seconds acquire timeout
+    ...getSSLConfig()
+};
+
+// Remove socketPath from config if not being used
+if (!process.env.DB_SOCKET_PATH) {
+    delete connectionConfig.socketPath;
+}
+
+// Enhanced database connection pool
+const db = mysql.createPool(connectionConfig);
 
 // Database connection event handlers
 db.on('connection', (connection) => {
     logger.info('New database connection established', {
         connection_id: connection.threadId,
-        host: process.env.DB_HOST,
-        port: process.env.DB_PORT || 3306, // ✅ Include port in logs
+        host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+        port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
         database: process.env.DB_DATABASE,
+        ssl_enabled: !!process.env.DB_SSL_CA || !!process.env.DB_SOCKET_PATH,
         category: 'database_connection'
     });
 });
@@ -44,8 +92,8 @@ db.on('connection', (connection) => {
 db.on('error', (error) => {
     logError(error, {
         context: 'database_pool_error',
-        host: process.env.DB_HOST,
-        port: process.env.DB_PORT || 3306, // ✅ Include port in error logs
+        host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+        port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
         database: process.env.DB_DATABASE
     });
     
@@ -59,100 +107,126 @@ db.on('error', (error) => {
     }
 });
 
-// Enhanced database connection test with comprehensive checks
-const testConnection = async () => {
+// Enhanced database connection test with retry logic
+const testConnection = async (retries = 3, delayMs = 2000) => {
     const startTime = Date.now();
     
-    try {
-        logger.info('Testing database connection', {
-            host: process.env.DB_HOST,
-            port: process.env.DB_PORT || 3306, // ✅ Include port in connection test logs
-            database: process.env.DB_DATABASE,
-            user: process.env.DB_USER
-        });
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            logger.info(`Testing database connection (attempt ${attempt}/${retries})`, {
+                host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                database: process.env.DB_DATABASE,
+                user: process.env.DB_USER,
+                ssl_enabled: !!process.env.DB_SSL_CA || !!process.env.DB_SOCKET_PATH
+            });
 
-        // Basic connectivity test
-        const [basicTest] = await db.execute('SELECT 1 as test');
-        const basicTestTime = Date.now() - startTime;
-        
-        // Test database schema accessibility
-        const [schemaTest] = await db.execute('SELECT COUNT(*) as table_count FROM information_schema.tables WHERE table_schema = ?', [process.env.DB_DATABASE]);
-        
-        // Test write capabilities with a simple operation
-        const writeTestStart = Date.now();
-        await db.execute('SELECT 1 as write_test');
-        const writeTestTime = Date.now() - writeTestStart;
-        
-        // Get connection pool status
-        const poolStatus = {
-            total_connections: db._allConnections ? db._allConnections.length : 'unknown',
-            free_connections: db._freeConnections ? db._freeConnections.length : 'unknown',
-            acquired_connections: db._acquiringConnections ? db._acquiringConnections.length : 'unknown'
-        };
+            // Basic connectivity test
+            const [basicTest] = await db.execute('SELECT 1 as test');
+            const basicTestTime = Date.now() - startTime;
+            
+            // Test database schema accessibility
+            const [schemaTest] = await db.execute(
+                'SELECT COUNT(*) as table_count FROM information_schema.tables WHERE table_schema = ?',
+                [process.env.DB_DATABASE]
+            );
+            
+            // Test write capabilities
+            const writeTestStart = Date.now();
+            await db.execute('SELECT 1 as write_test');
+            const writeTestTime = Date.now() - writeTestStart;
+            
+            // Get connection pool status
+            const poolStatus = {
+                total_connections: db._allConnections ? db._allConnections.length : 'unknown',
+                free_connections: db._freeConnections ? db._freeConnections.length : 'unknown',
+                acquired_connections: db._acquiringConnections ? db._acquiringConnections.length : 'unknown'
+            };
 
-        const totalTime = Date.now() - startTime;
-        
-        logger.info('✅ Database connection test successful', {
-            basic_test_time_ms: basicTestTime,
-            write_test_time_ms: writeTestTime,
-            total_time_ms: totalTime,
-            table_count: schemaTest[0].table_count,
-            pool_status: poolStatus,
-            host: process.env.DB_HOST,
-            port: process.env.DB_PORT || 3306, // ✅ Include port in success logs
-            category: 'database_health'
-        });
+            const totalTime = Date.now() - startTime;
+            
+            logger.info('✅ Database connection test successful', {
+                attempt,
+                basic_test_time_ms: basicTestTime,
+                write_test_time_ms: writeTestTime,
+                total_time_ms: totalTime,
+                table_count: schemaTest[0].table_count,
+                pool_status: poolStatus,
+                host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                ssl_enabled: !!process.env.DB_SSL_CA || !!process.env.DB_SOCKET_PATH,
+                category: 'database_health'
+            });
 
-        logPerformance('database_connection_test', totalTime, {
-            host: process.env.DB_HOST,
-            port: process.env.DB_PORT || 3306, // ✅ Include port in performance logs
-            database: process.env.DB_DATABASE,
-            success: true
-        });
+            logPerformance('database_connection_test', totalTime, {
+                host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                database: process.env.DB_DATABASE,
+                success: true,
+                attempt
+            });
 
-        return {
-            success: true,
-            response_time: totalTime,
-            table_count: schemaTest[0].table_count,
-            pool_status: poolStatus,
-            connection_info: {
-                host: process.env.DB_HOST,
-                port: process.env.DB_PORT || 3306,
-                database: process.env.DB_DATABASE
+            return {
+                success: true,
+                response_time: totalTime,
+                table_count: schemaTest[0].table_count,
+                pool_status: poolStatus,
+                connection_info: {
+                    host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                    port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                    database: process.env.DB_DATABASE,
+                    ssl_enabled: !!process.env.DB_SSL_CA || !!process.env.DB_SOCKET_PATH
+                }
+            };
+
+        } catch (error) {
+            const totalTime = Date.now() - startTime;
+            
+            if (attempt === retries) {
+                // Final attempt failed
+                logError(error, {
+                    context: 'database_connection_test_failed',
+                    host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                    port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                    database: process.env.DB_DATABASE,
+                    user: process.env.DB_USER,
+                    test_duration_ms: totalTime,
+                    attempts: retries
+                });
+
+                logPerformance('database_connection_test', totalTime, {
+                    host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                    port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                    database: process.env.DB_DATABASE,
+                    success: false,
+                    error: error.message,
+                    attempts: retries
+                });
+
+                return {
+                    success: false,
+                    error: error.message,
+                    error_code: error.code,
+                    response_time: totalTime,
+                    connection_info: {
+                        host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                        port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                        database: process.env.DB_DATABASE
+                    }
+                };
             }
-        };
 
-    } catch (error) {
-        const totalTime = Date.now() - startTime;
-        
-        logError(error, {
-            context: 'database_connection_test_failed',
-            host: process.env.DB_HOST,
-            port: process.env.DB_PORT || 3306, // ✅ Include port in error context
-            database: process.env.DB_DATABASE,
-            user: process.env.DB_USER,
-            test_duration_ms: totalTime
-        });
+            // Log retry attempt
+            logger.warn(`Database connection test failed, retrying in ${delayMs}ms`, {
+                attempt,
+                retries,
+                error: error.message,
+                error_code: error.code
+            });
 
-        logPerformance('database_connection_test', totalTime, {
-            host: process.env.DB_HOST,
-            port: process.env.DB_PORT || 3306, // ✅ Include port in failed performance logs
-            database: process.env.DB_DATABASE,
-            success: false,
-            error: error.message
-        });
-
-        return {
-            success: false,
-            error: error.message,
-            error_code: error.code,
-            response_time: totalTime,
-            connection_info: {
-                host: process.env.DB_HOST,
-                port: process.env.DB_PORT || 3306,
-                database: process.env.DB_DATABASE
-            }
-        };
+            // Wait before retrying
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
     }
 };
 
@@ -179,7 +253,9 @@ const checkDatabaseHealth = async () => {
 
         // Get database performance metrics
         const [processlist] = await db.execute('SHOW PROCESSLIST');
-        const [status] = await db.execute("SHOW STATUS WHERE Variable_name IN ('Threads_connected', 'Queries', 'Uptime', 'Slow_queries')");
+        const [status] = await db.execute(
+            "SHOW STATUS WHERE Variable_name IN ('Threads_connected', 'Queries', 'Uptime', 'Slow_queries')"
+        );
         
         const statusObj = status.reduce((acc, row) => {
             acc[row.Variable_name.toLowerCase()] = row.Value;
@@ -193,8 +269,9 @@ const checkDatabaseHealth = async () => {
             server_stats: statusObj,
             table_checks: tableChecks,
             connection_info: {
-                host: process.env.DB_HOST,
-                port: process.env.DB_PORT || 3306 // ✅ Include port in health data
+                host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306),
+                ssl_enabled: !!process.env.DB_SSL_CA || !!process.env.DB_SOCKET_PATH
             },
             timestamp: new Date().toISOString()
         };
@@ -213,8 +290,8 @@ const checkDatabaseHealth = async () => {
             error: error.message,
             error_code: error.code,
             connection_info: {
-                host: process.env.DB_HOST,
-                port: process.env.DB_PORT || 3306 // ✅ Include port in error health data
+                host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+                port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306)
             },
             timestamp: new Date().toISOString()
         };
@@ -234,7 +311,6 @@ const executeQuery = async (query, params = [], userId = null, operation = 'SELE
     const queryId = `query_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     
     try {
-        // Log query execution (sanitized for security)
         logDatabaseOperation(operation, 'multiple', userId, {
             query_id: queryId,
             query_preview: query.substring(0, 100) + (query.length > 100 ? '...' : ''),
@@ -245,7 +321,6 @@ const executeQuery = async (query, params = [], userId = null, operation = 'SELE
         const [results, fields] = await db.execute(query, params);
         const duration = Date.now() - startTime;
 
-        // Log performance metrics
         logPerformance(`database_${operation.toLowerCase()}`, duration, {
             query_id: queryId,
             affected_rows: results.affectedRows || results.length || 0,
@@ -284,7 +359,6 @@ const executeQuery = async (query, params = [], userId = null, operation = 'SELE
             error: error.message
         });
 
-        // Re-throw the error for proper error handling upstream
         throw error;
     }
 };
@@ -353,7 +427,7 @@ const withTransaction = async (callback, userId = null) => {
     }
 };
 
-// Database connection monitoring
+// Database connection monitoring (disabled in production)
 const startConnectionMonitoring = () => {
     if (process.env.NODE_ENV === 'development') {
         setInterval(async () => {
@@ -377,8 +451,8 @@ const startConnectionMonitoring = () => {
 const closeDatabase = async () => {
     try {
         logger.info('Closing database connections...', {
-            host: process.env.DB_HOST,
-            port: process.env.DB_PORT || 3306 // ✅ Include port in shutdown logs
+            host: process.env.DB_SOCKET_PATH ? 'unix_socket' : process.env.DB_HOST,
+            port: process.env.DB_SOCKET_PATH ? 'N/A' : (process.env.DB_PORT || 3306)
         });
         await db.end();
         logger.info('Database connections closed successfully');
