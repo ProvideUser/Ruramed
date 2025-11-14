@@ -1,4 +1,4 @@
-import { Storage } from '@google-cloud/storage';
+import { createClient } from '@supabase/supabase-js';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -14,26 +14,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const isProduction = process.env.NODE_ENV === 'production';
-const bucketName = process.env.GCS_BUCKET_NAME;
 
-// ---------------------------------------------------------
-// ☁️ Initialize Google Cloud Storage
-// ---------------------------------------------------------
-let storage;
-let bucket;
-
-if (isProduction && bucketName) {
-  try {
-    storage = new Storage(); // Uses Application Default Credentials in GCP
-    bucket = storage.bucket(bucketName);
-    logger.info('Google Cloud Storage initialized', {
-      bucket: bucketName,
-      category: 'storage',
-    });
-  } catch (error) {
-    logError(error, { context: 'gcs_initialization' });
-  }
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY; // Use service role key for server
+if (!supabaseUrl || !supabaseKey) {
+  throw new Error('SUPABASE_URL and SUPABASE_SERVICE_KEY must be set');
 }
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+const bucketName = process.env.SUPABASE_BUCKET || 'uploads';
 
 // ---------------------------------------------------------
 // 💾 Local Upload Directory (Development Only)
@@ -68,9 +57,10 @@ const createLocalStorage = (subfolder = '') => {
 };
 
 // ---------------------------------------------------------
-// 🔍 File Filter Functions
+// 🔍 File Filter Functions (unchanged)
 // ---------------------------------------------------------
 const fileFilters = {
+  // ...same as your original fileFilters with prescriptions, images, documents
   prescriptions: (req, file, cb) => {
     const allowedTypes = /jpeg|jpg|png|pdf/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
@@ -87,7 +77,6 @@ const fileFilters = {
       cb(new Error('Only images (JPEG, JPG, PNG) and PDF files are allowed for prescriptions!'));
     }
   },
-
   images: (req, file, cb) => {
     const allowedTypes = /jpeg|jpg|png|gif|webp/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
@@ -101,7 +90,6 @@ const fileFilters = {
       cb(new Error('Only image files (JPEG, JPG, PNG, GIF, WEBP) are allowed!'));
     }
   },
-
   documents: (req, file, cb) => {
     const allowedTypes = /pdf|doc|docx/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
@@ -118,59 +106,45 @@ const fileFilters = {
 };
 
 // ---------------------------------------------------------
-// ☁️ Upload File to Google Cloud Storage
+// ☁️ Upload File to Supabase Storage
 // ---------------------------------------------------------
-const uploadToGCS = async (file, subfolder = '', userId = null) => {
+const uploadToSupabase = async (file, subfolder = '', userId = null) => {
   try {
     const extension = path.extname(file.originalname);
     const filename = `${subfolder}/${uuidv4()}${extension}`;
-    const blob = bucket.file(filename);
 
-    const blobStream = blob.createWriteStream({
-      resumable: false,
-      metadata: {
-        contentType: file.mimetype,
-        metadata: {
-          originalName: file.originalname,
-          uploadDate: new Date().toISOString(),
-          userId: userId || 'anonymous',
-        },
-      },
+    const { data, error } = await supabase.storage.from(bucketName).upload(filename, file.buffer, {
+      cacheControl: '3600',
+      upsert: false,
+      contentType: file.mimetype,
     });
 
-    return new Promise((resolve, reject) => {
-      blobStream.on('error', (error) => {
-        logError(error, { context: 'gcs_upload_stream_error', filename, userId });
-        reject(error);
-      });
+    if (error) {
+      logError(error, { context: 'supabase_upload_error', filename, userId });
+      throw error;
+    }
 
-      blobStream.on('finish', async () => {
-        try {
-          await blob.makePublic();
-          const publicUrl = `https://storage.googleapis.com/${bucketName}/${filename}`;
+    // Make public URL
+    const { publicUrl, error: urlError } = supabase.storage.from(bucketName).getPublicUrl(filename);
+    if (urlError) {
+      logError(urlError, { context: 'supabase_get_public_url_error', filename, userId });
+      throw urlError;
+    }
 
-          logFileOperation('upload', filename, userId, {
-            size: file.size,
-            mimetype: file.mimetype,
-            subfolder,
-          });
-
-          resolve({
-            filename,
-            url: publicUrl,
-            size: file.size,
-            mimetype: file.mimetype,
-          });
-        } catch (error) {
-          logError(error, { context: 'gcs_make_public_error', filename, userId });
-          reject(error);
-        }
-      });
-
-      blobStream.end(file.buffer);
+    logFileOperation('upload', filename, userId, {
+      size: file.size,
+      mimetype: file.mimetype,
+      subfolder,
     });
+
+    return {
+      filename,
+      url: publicUrl,
+      size: file.size,
+      mimetype: file.mimetype,
+    };
   } catch (error) {
-    logError(error, { context: 'gcs_upload_error', userId });
+    logError(error, { context: 'file_upload_processing', subfolder, userId });
     throw error;
   }
 };
@@ -178,13 +152,8 @@ const uploadToGCS = async (file, subfolder = '', userId = null) => {
 // ---------------------------------------------------------
 // ⚙️ Multer Config Generator
 // ---------------------------------------------------------
-const createMulterConfig = (
-  subfolder = '',
-  maxSize = 5 * 1024 * 1024,
-  maxFiles = 5,
-  filterType = 'images'
-) => ({
-  storage: isProduction && bucketName ? multer.memoryStorage() : createLocalStorage(subfolder),
+const createMulterConfig = (subfolder = '', maxSize = 5 * 1024 * 1024, maxFiles = 5, filterType = 'images') => ({
+  storage: isProduction ? multer.memoryStorage() : createLocalStorage(subfolder),
   limits: { fileSize: maxSize, files: maxFiles },
   fileFilter: fileFilters[filterType],
 });
@@ -210,20 +179,20 @@ export const processUploadedFiles = (subfolder = '') => {
       const userId = req.user?.id || null;
 
       // Single file
-      if (req.file && isProduction && bucketName) {
-        const result = await uploadToGCS(req.file, subfolder, userId);
-        req.file.gcsUrl = result.url;
-        req.file.gcsFilename = result.filename;
+      if (req.file && isProduction) {
+        const result = await uploadToSupabase(req.file, subfolder, userId);
+        req.file.supabaseUrl = result.url;
+        req.file.supabaseFilename = result.filename;
         req.file.path = result.url; // backward compatibility
       }
 
       // Multiple files
-      if (req.files && isProduction && bucketName) {
+      if (req.files && isProduction) {
         const filesArray = Array.isArray(req.files) ? req.files : Object.values(req.files).flat();
         for (const file of filesArray) {
-          const result = await uploadToGCS(file, subfolder, userId);
-          file.gcsUrl = result.url;
-          file.gcsFilename = result.filename;
+          const result = await uploadToSupabase(file, subfolder, userId);
+          file.supabaseUrl = result.url;
+          file.supabaseFilename = result.filename;
           file.path = result.url;
         }
       }
@@ -256,8 +225,8 @@ export const processAndUploadImage = async (file, options = {}, userId = null) =
       size: processedBuffer.length,
     };
 
-    if (isProduction && bucketName) {
-      return await uploadToGCS(processedFile, subfolder, userId);
+    if (isProduction) {
+      return await uploadToSupabase(processedFile, subfolder, userId);
     }
 
     const filename = `${uuidv4()}.jpg`;
@@ -291,9 +260,10 @@ export const processAndUploadImage = async (file, options = {}, userId = null) =
 export const fileUtils = {
   fileExists: async (filename) => {
     try {
-      if (isProduction && bucketName) {
-        const [exists] = await bucket.file(filename).exists();
-        return exists;
+      if (isProduction) {
+        const { data, error } = await supabase.storage.from(bucketName).list('', { search: filename });
+        if (error) throw error;
+        return data.some(item => item.name === filename);
       }
       return fs.existsSync(path.join(uploadsDir, filename));
     } catch (error) {
@@ -304,9 +274,10 @@ export const fileUtils = {
 
   deleteFile: async (filename, userId = null) => {
     try {
-      if (isProduction && bucketName) {
-        await bucket.file(filename).delete();
-        logFileOperation('delete', filename, userId, { source: 'gcs' });
+      if (isProduction) {
+        const { error } = await supabase.storage.from(bucketName).remove([filename]);
+        if (error) throw error;
+        logFileOperation('delete', filename, userId, { source: 'supabase' });
         return true;
       }
       const filePath = path.join(uploadsDir, filename);
@@ -324,16 +295,17 @@ export const fileUtils = {
 
   getFileInfo: async (filename) => {
     try {
-      if (isProduction && bucketName) {
-        const [metadata] = await bucket.file(filename).getMetadata();
+      if (isProduction) {
+        const { data: metadata, error } = await supabase.storage.from(bucketName).getMetadata(filename);
+        if (error) throw error;
         return {
           size: parseInt(metadata.size),
           sizeFormatted: formatFileSize(parseInt(metadata.size)),
-          created: new Date(metadata.timeCreated),
-          modified: new Date(metadata.updated),
+          created: new Date(metadata.created_at || metadata.timeCreated),
+          modified: new Date(metadata.updated_at || metadata.updated),
           extension: path.extname(filename),
           name: path.basename(filename),
-          contentType: metadata.contentType,
+          contentType: metadata.content_type || metadata.contentType,
         };
       }
 
@@ -356,9 +328,9 @@ export const fileUtils = {
   },
 
   getFileUrl: (filename, subfolder = '') => {
-    if (isProduction && bucketName) {
+    if (isProduction) {
       const fullPath = subfolder ? `${subfolder}/${filename}` : filename;
-      return `https://storage.googleapis.com/${bucketName}/${fullPath}`;
+      return supabase.storage.from(bucketName).getPublicUrl(fullPath).data.publicUrl;
     }
     const baseUrl = process.env.BASE_URL || 'http://localhost:5000';
     const folderPath = subfolder ? `${subfolder}/` : '';
@@ -367,8 +339,9 @@ export const fileUtils = {
 
   copyFile: async (sourceFilename, destinationFilename, userId = null) => {
     try {
-      if (isProduction && bucketName) {
-        await bucket.file(sourceFilename).copy(bucket.file(destinationFilename));
+      if (isProduction) {
+        const { error } = await supabase.storage.from(bucketName).copy(sourceFilename, destinationFilename);
+        if (error) throw error;
         logFileOperation('copy', destinationFilename, userId, { source: sourceFilename });
         return true;
       }
@@ -423,9 +396,7 @@ export const handleUploadError = (error, req, res, next) => {
 
   if (error) {
     logError(error, { context: 'upload_error', userId: req.user?.id });
-    return res
-      .status(400)
-      .json({ error: 'File upload failed', details: error.message });
+    return res.status(400).json({ error: 'File upload failed', details: error.message });
   }
 
   next();

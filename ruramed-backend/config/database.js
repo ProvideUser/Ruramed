@@ -8,11 +8,15 @@ dotenv.config();
 const isProduction = process.env.NODE_ENV === 'production';
 
 // Build PostgreSQL connection configuration
+// Use Supabase connection string DATABASE_URL and port 6543 for the pooler
 const connectionConfig = process.env.DATABASE_URL
   ? {
-      connectionString: process.env.DATABASE_URL,
+      connectionString: process.env.DATABASE_URL.replace(
+        /:5432/,
+        ':6543' // Use transaction pooler port by default
+      ),
       ssl: isProduction ? { rejectUnauthorized: false } : false,
-      max: parseInt(process.env.DB_CONNECTION_LIMIT) || 10,
+      max: parseInt(process.env.DB_CONNECTION_LIMIT) || 20, // Higher max connections for pooler
       idleTimeoutMillis: 300000,
       connectionTimeoutMillis: 10000,
     }
@@ -21,20 +25,21 @@ const connectionConfig = process.env.DATABASE_URL
       user: process.env.DB_USER,
       password: process.env.DB_PASSWORD,
       database: process.env.DB_DATABASE,
-      port: parseInt(process.env.DB_PORT) || 5432,
+      port: parseInt(process.env.DB_PORT) || 6543, // Default to pooler port 6543
       ssl: isProduction ? { rejectUnauthorized: false } : false,
-      max: parseInt(process.env.DB_CONNECTION_LIMIT) || 10,
+      max: parseInt(process.env.DB_CONNECTION_LIMIT) || 20,
       idleTimeoutMillis: 300000,
       connectionTimeoutMillis: 10000,
     };
 
 const db = new Pool(connectionConfig);
 
-// Database connection event handlers
+// Database connection events
 db.on('connect', () => {
   logger.info('New database connection established', {
     database: process.env.DB_DATABASE || 'postgres',
     ssl_enabled: !!isProduction,
+    connectionString: connectionConfig.connectionString || undefined,
     category: 'database_connection',
   });
 });
@@ -46,7 +51,7 @@ db.on('error', (error) => {
   });
 });
 
-// Test connection with retry logic
+// Test connection with retry logic and enhanced logging
 const testConnection = async (retries = 3, delayMs = 2000) => {
   const startTime = Date.now();
 
@@ -95,7 +100,7 @@ const testConnection = async (retries = 3, delayMs = 2000) => {
   }
 };
 
-// Health check
+// Health check function
 const checkDatabaseHealth = async () => {
   const startTime = Date.now();
 
@@ -136,10 +141,11 @@ const checkDatabaseHealth = async () => {
   }
 };
 
-// PostgreSQL-style query execution
+// PostgreSQL query execution with detailed logging and performance tracking
 const executeQuery = async (query, params = [], userId = null, operation = 'SELECT') => {
   const startTime = Date.now();
   const queryId = `query_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+
   try {
     logDatabaseOperation(operation, 'multiple', userId, {
       query_id: queryId,
@@ -180,7 +186,7 @@ const executeQuery = async (query, params = [], userId = null, operation = 'SELE
   }
 };
 
-// Transaction wrapper
+// Transaction wrapper with logging
 const withTransaction = async (callback, userId = null) => {
   const client = await db.connect();
   const transactionId = `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -230,6 +236,7 @@ const closeDatabase = async () => {
   }
 };
 
+// Handle shutdown signals gracefully
 process.on('SIGTERM', closeDatabase);
 process.on('SIGINT', closeDatabase);
 
