@@ -15,33 +15,52 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Use multer memory storage to access file buffer
-export const uploadMiddleware = multer({
-  storage: multerStorageMemory(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB max
+// Define per-bucket config for allowed MIME types and max file size (bytes)
+const bucketConfigs = {
+  'medicine-images': {
+    maxFileSize: 5 * 1024 * 1024, // 5MB
+    allowedTypes: /jpeg|jpg|png|webp/,
   },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|pdf|doc|docx/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-
-    if (extname && mimetype) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type'));
-    }
+  'prescriptions': {
+    maxFileSize: 10 * 1024 * 1024, // 10MB
+    allowedTypes: /jpeg|jpg|png|pdf/,
   },
-});
+  'user-profiles': {
+    maxFileSize: 2 * 1024 * 1024, // 2MB
+    allowedTypes: /jpeg|jpg|png|webp/,
+  }
+};
 
-// Upload file buffer to Supabase Storage
+// Create multer upload middleware dynamically per bucket
+export const createUploadMiddleware = (bucket) => {
+  const config = bucketConfigs[bucket];
+  if (!config) throw new Error(`Invalid bucket name: ${bucket}`);
+
+  return multer({
+    storage: multerStorageMemory(),
+    limits: {
+      fileSize: config.maxFileSize,
+    },
+    fileFilter: (req, file, cb) => {
+      const extname = config.allowedTypes.test(path.extname(file.originalname).toLowerCase());
+      const mimetype = config.allowedTypes.test(file.mimetype);
+      if (extname && mimetype) {
+        cb(null, true);
+      } else {
+        cb(new Error(`Invalid file type for ${bucket}`));
+      }
+    },
+  });
+};
+
+// Generic function to upload file buffer to Supabase with folder support
 export const uploadFileToSupabase = async (fileBuffer, originalName, bucket = 'uploads', folder = '') => {
   try {
     const uniqueFileName = `${folder ? folder + '/' : ''}${uuidv4()}${path.extname(originalName)}`;
     const { data, error } = await supabase.storage.from(bucket).upload(uniqueFileName, fileBuffer, {
-      cacheControl: '3600', // 1 hour cache
+      cacheControl: '3600',
       upsert: false,
-      contentType: null, // autodetect
+      contentType: null,
     });
 
     if (error) {
@@ -57,12 +76,12 @@ export const uploadFileToSupabase = async (fileBuffer, originalName, bucket = 'u
   }
 };
 
-// Get public URL for a file in Supabase Storage bucket
+// Get public URL for a file in storage bucket
 export const getPublicUrl = (filePath, bucket = 'uploads') => {
   return supabase.storage.from(bucket).getPublicUrl(filePath).data.publicUrl;
 };
 
-// Delete file from Supabase Storage bucket
+// Delete file from storage bucket
 export const deleteFile = async (filePath, bucket = 'uploads') => {
   try {
     const { error } = await supabase.storage.from(bucket).remove([filePath]);
@@ -75,3 +94,13 @@ export const deleteFile = async (filePath, bucket = 'uploads') => {
     throw error;
   }
 };
+
+// Convenience upload functions for each bucket:
+export const uploadMedicineImage = (fileBuffer, originalName) =>
+  uploadFileToSupabase(fileBuffer, originalName, 'medicine-images');
+
+export const uploadPrescription = (fileBuffer, originalName, userId) =>
+  uploadFileToSupabase(fileBuffer, originalName, 'prescriptions', userId);
+
+export const uploadUserProfilePicture = (fileBuffer, originalName, userId) =>
+  uploadFileToSupabase(fileBuffer, originalName, 'user-profiles', userId);
